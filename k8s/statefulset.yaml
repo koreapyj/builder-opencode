@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opencode
+  namespace: opencode
+  labels:
+    app: opencode
+spec:
+  serviceName: opencode
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencode
+  template:
+    metadata:
+      labels:
+        app: opencode
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: opencode
+          image: ghcr.io/koreapyj/opencode-k8s:latest
+          args: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
+          ports:
+            - name: http
+              containerPort: 4096
+          envFrom:
+            - secretRef:
+                name: opencode-secrets
+          volumeMounts:
+            - name: opencode-home
+              mountPath: /home/opencode
+          # /global/health requires Basic auth when OPENCODE_SERVER_PASSWORD is set,
+          # so probes must be exec+curl (httpGet cannot send credentials from a Secret).
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -fsS -u "${OPENCODE_SERVER_USERNAME:-opencode}:${OPENCODE_SERVER_PASSWORD:-}" http://127.0.0.1:4096/global/health
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -fsS -u "${OPENCODE_SERVER_USERNAME:-opencode}:${OPENCODE_SERVER_PASSWORD:-}" http://127.0.0.1:4096/global/health
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -fsS -u "${OPENCODE_SERVER_USERNAME:-opencode}:${OPENCODE_SERVER_PASSWORD:-}" http://127.0.0.1:4096/global/health
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: opencode-home
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
