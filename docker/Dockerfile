@@ -32,7 +32,12 @@ RUN apk add --no-cache \
 
 COPY --from=download /tmp/opencode/opencode /usr/local/bin/opencode
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh && opencode --version
+COPY docker/restart-opencode.sh /usr/local/bin/restart-opencode
+# Baked outside $HOME because the PVC shadows /home/opencode; entrypoint copies
+# these into ~/.config/opencode/commands/ at startup.
+COPY docker/commands/ /usr/local/share/opencode/commands/
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/restart-opencode \
+ && opencode --version
 
 RUN addgroup -g 1000 opencode \
  && adduser -D -u 1000 -G opencode -h /home/opencode opencode
