@@ -1,36 +1,100 @@
 name: build-push
 
 on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily — picks up new upstream opencode releases
   push:
-    branches: [main]
-    tags: ["v*.*.*"]
+    branches: [main] # image source changed — rebuild latest upstream release unconditionally
   workflow_dispatch:
     inputs:
       opencode_version:
-        description: "opencode release version to embed (e.g. 1.18.4); empty = Dockerfile default"
+        description: "opencode release version to build (e.g. 1.18.4); empty = latest upstream release"
         required: false
         type: string
+      force:
+        description: "Rebuild and push even if the tag already exists in GHCR"
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM_REPO: anomalyco/opencode
+  IMAGE_NAME: opencode-k8s
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      version: ${{ steps.ver.outputs.version }}
+      is_latest: ${{ steps.ver.outputs.is_latest }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Resolve lowercase image reference
+        id: image
+        run: |
+          echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      # Upstream tags are "v1.19.0"; the Dockerfile and image tags use "1.19.0".
+      - name: Resolve opencode version
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.opencode_version }}
+        run: |
+          set -euo pipefail
+          latest=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r '.tag_name')
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::error::Could not resolve latest release tag for ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          latest="${latest#v}"
+          version="${INPUT_VERSION#v}"
+          version="${version:-$latest}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "is_latest=$([ "$version" = "$latest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Building opencode ${version} (latest upstream: ${latest})"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only scheduled/unforced runs skip; a push to main must ship its changes.
+      - name: Check whether the tag already exists in GHCR
+        id: decide
+        run: |
+          set -euo pipefail
+          image="${{ steps.image.outputs.image }}"
+          version="${{ steps.ver.outputs.version }}"
+          if [ "${{ inputs.force }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
+            echo "Forced rebuild (${{ github.event_name }}) — building ${image}:${version}."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "${image}:${version}" > /dev/null 2>&1; then
+            echo "Image ${image}:${version} already exists — nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image ${image}:${version} not found — will build."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # Version precedence: dispatch input > git tag (v1.18.4 or v1.18.4-1 -> 1.18.4) > Dockerfile ARG default
-      - name: Resolve opencode version
-        id: ver
-        run: |
-          v="${{ inputs.opencode_version }}"
-          if [ -z "$v" ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            v="${GITHUB_REF#refs/tags/v}"
-            v="${v%%-*}"
-          fi
-          echo "value=$v" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -41,15 +105,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/opencode-k8s
-          tags: |
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -57,8 +112,15 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            ${{ steps.ver.outputs.value != '' && format('OPENCODE_VERSION={0}', steps.ver.outputs.value) || '' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+            OPENCODE_VERSION=${{ needs.check.outputs.version }}
+          # :latest only follows the newest upstream release, so backfilling an older version doesn't clobber it.
+          tags: |
+            ${{ needs.check.outputs.image }}:${{ needs.check.outputs.version }}
+            ${{ needs.check.outputs.is_latest == 'true' && format('{0}:latest', needs.check.outputs.image) || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=opencode ${{ needs.check.outputs.version }} web UI server for Kubernetes (from https://github.com/anomalyco/opencode)
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
